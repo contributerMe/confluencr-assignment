@@ -1,0 +1,7 @@
+__pycache__/
+.venv/
+*.pyc
+ledger.db
+ledger.db-journal
+ledger.db-wal
+ledger.db-shm
