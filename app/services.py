@@ -5,6 +5,8 @@ from uuid import uuid4
 
 from .database import get_connection
 
+logger = logging.getLogger(__name__)
+
 
 def create_account(name: str):
     cleaned_name = name.strip()
@@ -173,7 +175,7 @@ def add_transaction(account_id: str, transaction_type: str, amount: int,
     if not isinstance(reference_id, str) or not reference_id.strip():
         raise ValueError("Reference ID is required")
     if not isinstance(description, str):
-        raise ValueError("Description must be text")
+        raise TypeError("Description must be text")
 
     transaction = {
         "id": str(uuid4()),
@@ -231,7 +233,7 @@ def add_transaction(account_id: str, transaction_type: str, amount: int,
             connection.commit()
         except Exception:
             connection.rollback()
-            logging.exception("Could not save failed transaction attempt")
+            logger.exception("Could not save failed transaction attempt")
         raise
     finally:
         connection.close()
