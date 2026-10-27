@@ -1,5 +1,5 @@
-from pathlib import Path
 import sqlite3
+from pathlib import Path
 
 
 DATABASE_PATH = Path(__file__).resolve().parent.parent / "ledger.db"
