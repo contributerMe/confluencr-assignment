@@ -49,6 +49,14 @@ Install the development dependencies in the active virtual environment:
 python -m pip install -r requirements-dev.txt
 ```
 
+Install the Git pre-commit hook once in this repository:
+
+```bash
+pre-commit install
+```
+
+Before each commit, the hook runs Ruff and applies safe fixes automatically. If it changes a file, add that changed file and commit again.
+
 Run the test suite, lint check, and Python syntax check:
 
 ```bash
