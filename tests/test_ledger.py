@@ -1,4 +1,9 @@
+import sqlite3
+
+import pytest
+
 from app import database
+from app.services import transfer_money
 
 
 def test_create_and_retrieve_account(client):
@@ -167,3 +172,200 @@ def test_missing_account_and_invalid_history_parameters(client):
     assert client.get("/accounts/missing/balance").status_code == 404
     assert client.get("/accounts/missing/transactions").status_code == 404
     assert client.get("/accounts/missing/transactions?page=0").status_code == 422
+
+
+def test_transfer_moves_money_and_writes_both_ledger_entries(client, account):
+    source_id = account["id"]
+    destination = client.post("/accounts", json={"name": "Asha"}).json()
+    destination_id = destination["id"]
+    client.post(
+        f"/accounts/{source_id}/credits",
+        json={"amount": 5000, "reference_id": "transfer-funding"},
+    )
+
+    response = client.post(
+        "/transfers",
+        json={
+            "source_account_id": source_id,
+            "destination_account_id": destination_id,
+            "amount": 2000,
+            "reference_id": "transfer-001",
+            "description": "Pay Asha",
+        },
+    )
+
+    assert response.status_code == 201
+    result = response.json()
+    assert result["source_transaction"]["type"] == "debit"
+    assert result["destination_transaction"]["type"] == "credit"
+    assert result["source_transaction"]["reference_id"] == "transfer-001"
+    assert result["destination_transaction"]["reference_id"] == "transfer-001"
+    assert client.get(f"/accounts/{source_id}/balance").json()["balance"] == 3000
+    assert client.get(f"/accounts/{destination_id}/balance").json()["balance"] == 2000
+
+    attempts = database.get_connection()
+    try:
+        rows = attempts.execute(
+            """
+            SELECT status, transaction_id FROM transaction_attempts
+            WHERE reference_id = ? ORDER BY type
+            """,
+            ("transfer-001",),
+        ).fetchall()
+    finally:
+        attempts.close()
+    assert len(rows) == 2
+    assert all(status == "success" and transaction_id for status, transaction_id in rows)
+
+
+def test_transfer_rejects_insufficient_funds_and_records_failed_attempts(
+    client, account
+):
+    source_id = account["id"]
+    destination = client.post("/accounts", json={"name": "Asha"}).json()
+    destination_id = destination["id"]
+    client.post(
+        f"/accounts/{source_id}/credits",
+        json={"amount": 1000, "reference_id": "transfer-funding"},
+    )
+
+    response = client.post(
+        "/transfers",
+        json={
+            "source_account_id": source_id,
+            "destination_account_id": destination_id,
+            "amount": 1500,
+            "reference_id": "transfer-too-large",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Insufficient balance"
+    assert client.get(f"/accounts/{source_id}/balance").json()["balance"] == 1000
+    assert client.get(f"/accounts/{destination_id}/balance").json()["balance"] == 0
+    attempts = database.get_connection()
+    try:
+        rows = attempts.execute(
+            """
+            SELECT status, failure_reason, transaction_id
+            FROM transaction_attempts WHERE reference_id = ?
+            """,
+            ("transfer-too-large",),
+        ).fetchall()
+    finally:
+        attempts.close()
+    assert rows == [
+        ("failed", "Insufficient balance", None),
+        ("failed", "Insufficient balance", None),
+    ]
+
+
+def test_transfer_rejects_missing_account_and_duplicate_reference(client, account):
+    source_id = account["id"]
+    destination = client.post("/accounts", json={"name": "Asha"}).json()
+    destination_id = destination["id"]
+    client.post(
+        f"/accounts/{source_id}/credits",
+        json={"amount": 3000, "reference_id": "shared-reference"},
+    )
+
+    missing_destination = client.post(
+        "/transfers",
+        json={
+            "source_account_id": source_id,
+            "destination_account_id": "missing-account",
+            "amount": 500,
+            "reference_id": "missing-destination-transfer",
+        },
+    )
+    assert missing_destination.status_code == 404
+    assert client.get(f"/accounts/{source_id}/balance").json()["balance"] == 3000
+
+    missing_source = client.post(
+        "/transfers",
+        json={
+            "source_account_id": "missing-account",
+            "destination_account_id": destination_id,
+            "amount": 500,
+            "reference_id": "missing-source-transfer",
+        },
+    )
+    assert missing_source.status_code == 404
+    assert client.get(f"/accounts/{destination_id}/balance").json()["balance"] == 0
+
+    duplicate = client.post(
+        "/transfers",
+        json={
+            "source_account_id": source_id,
+            "destination_account_id": destination_id,
+            "amount": 500,
+            "reference_id": "shared-reference",
+        },
+    )
+    assert duplicate.status_code == 409
+    assert duplicate.json()["detail"] == "Transaction already exists"
+    assert client.get(f"/accounts/{source_id}/balance").json()["balance"] == 3000
+    assert client.get(f"/accounts/{destination_id}/balance").json()["balance"] == 0
+
+
+def test_transfer_rolls_back_both_sides_if_second_ledger_insert_fails(client, account):
+    source_id = account["id"]
+    destination = client.post("/accounts", json={"name": "Asha"}).json()
+    destination_id = destination["id"]
+    client.post(
+        f"/accounts/{source_id}/credits",
+        json={"amount": 3000, "reference_id": "transfer-funding"},
+    )
+
+    connection = database.get_connection()
+    try:
+        connection.execute(
+            f"""
+            CREATE TRIGGER reject_destination_credit
+            BEFORE INSERT ON transactions
+            WHEN NEW.account_id = '{destination_id}' AND NEW.type = 'credit'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced destination failure');
+            END
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced destination failure"):
+        transfer_money(source_id, destination_id, 1000, "transfer-atomicity")
+
+    assert client.get(f"/accounts/{source_id}/balance").json()["balance"] == 3000
+    assert client.get(f"/accounts/{destination_id}/balance").json()["balance"] == 0
+    connection = database.get_connection()
+    try:
+        transaction_count = connection.execute(
+            "SELECT COUNT(*) FROM transactions WHERE reference_id = ?",
+            ("transfer-atomicity",),
+        ).fetchone()[0]
+        attempts = connection.execute(
+            "SELECT status FROM transaction_attempts WHERE reference_id = ?",
+            ("transfer-atomicity",),
+        ).fetchall()
+    finally:
+        connection.close()
+    assert transaction_count == 0
+    assert attempts == [("failed",), ("failed",)]
+
+
+def test_transfer_validates_amount_accounts_and_distinct_endpoints(client, account):
+    other = client.post("/accounts", json={"name": "Asha"}).json()
+    request = {
+        "source_account_id": account["id"],
+        "destination_account_id": other["id"],
+        "amount": 0,
+        "reference_id": "invalid-transfer",
+    }
+    assert client.post("/transfers", json=request).status_code == 422
+
+    request["amount"] = 100
+    request["destination_account_id"] = account["id"]
+    response = client.post("/transfers", json=request)
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Source and destination accounts must be different"

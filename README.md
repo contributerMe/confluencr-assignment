@@ -65,7 +65,7 @@ ruff check app tests
 python -m compileall -q app tests
 ```
 
-The test suite covers account creation and lookup, balance reads, credits, debits, duplicate references, failed attempts, and transaction history filtering and pagination. Latest local results: **8 tests passed** and Python syntax compilation passed. GitHub Actions runs the tests and code quality checks on each push and pull request.
+The test suite covers account creation and lookup, balance reads, credits, debits, transfers, duplicate references, failed attempts, and transaction history filtering and pagination. GitHub Actions runs the tests and code quality checks on each push and pull request.
 
 ## API endpoints
 
@@ -77,6 +77,7 @@ The test suite covers account creation and lookup, balance reads, credits, debit
 | `GET` | `/accounts/{account_id}/balance` | Get the current balance |
 | `POST` | `/accounts/{account_id}/credits` | Add a credit |
 | `POST` | `/accounts/{account_id}/debits` | Add a debit if funds are sufficient |
+| `POST` | `/transfers` | Transfer money between two accounts atomically |
 | `GET` | `/accounts/{account_id}/transactions` | Get newest-first transaction history |
 
 ### Creating an account
@@ -103,6 +104,22 @@ Send a request to the account's `/credits` or `/debits` path with:
 
 Amounts are positive whole numbers of paise: `5000` means ₹50. A reference ID can be used only once per account. Repeated references and debits with insufficient funds are rejected.
 
+### Transferring money
+
+Send `POST /transfers` with both account IDs, a positive amount, and a reference ID:
+
+```json
+{
+  "source_account_id": "SOURCE_ACCOUNT_ID",
+  "destination_account_id": "DESTINATION_ACCOUNT_ID",
+  "amount": 3000,
+  "reference_id": "transfer-001",
+  "description": "Pay Asha"
+}
+```
+
+The response contains a debit transaction for the source and a credit transaction for the destination. Both entries use the same reference ID, which is allowed because reference IDs are unique per account. The source and destination must be different accounts. A transfer requires both accounts to exist, an unused reference on each account, and sufficient source funds. Both balances and transaction entries are committed together; on failure neither balance changes.
+
 ### Transaction history
 
 `GET /accounts/{account_id}/transactions` accepts optional query parameters:
@@ -118,9 +135,11 @@ The response includes the page number, page size, total records, total pages, an
 ## Data and consistency
 
 - `accounts` stores each account and its current balance.
-- `transactions` stores successful credits and debits. These records are the account's money movement history.
+- `transactions` stores successful credits, debits, and transfer entries. These records are the account's money movement history.
 - `transaction_attempts` records valid processing attempts as `success` or `failed`, including a reason for failures. A failed attempt does not change the balance or create a successful transaction.
 - The successful transaction and balance update are committed together. If either operation fails, both are rolled back; the failed attempt is then saved separately.
+- A transfer creates one debit and one credit transaction. Both balance changes and both entries are committed in the same database transaction; a failure rolls back all four changes.
+- Transfer attempts are recorded for both sides with the same reference ID and outcome.
 - Duplicate reference IDs are rejected for the same account. The same reference can be used by a different account.
 
 ## Assumptions
@@ -129,4 +148,4 @@ The response includes the page number, page size, total records, total pages, an
 - Amounts are stored as integer paise to avoid decimal rounding errors.
 - Invalid request data is rejected before an attempt is recorded. Attempts are recorded when processing begins with a valid account ID value, amount, reference, and description.
 - Transaction history contains successful transactions only; failed attempts are kept separately for auditability.
-- Money transfer is an optional assignment bonus and has not been implemented yet.
+- A transfer between an account and itself is rejected as invalid.

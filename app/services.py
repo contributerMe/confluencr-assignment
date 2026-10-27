@@ -249,3 +249,118 @@ def debit_account(account_id: str, amount: int, reference_id: str, description: 
     return add_transaction(account_id, "debit", amount, reference_id, description)
 
 
+def transfer_money(
+    source_account_id: str,
+    destination_account_id: str,
+    amount: int,
+    reference_id: str,
+    description: str = "",
+):
+    if type(amount) is not int or amount <= 0:
+        raise ValueError("Amount must be a positive whole number of paise")
+    if not isinstance(reference_id, str) or not reference_id.strip():
+        raise ValueError("Reference ID is required")
+    if not isinstance(description, str):
+        raise TypeError("Description must be text")
+    if source_account_id == destination_account_id:
+        raise ValueError("Source and destination accounts must be different")
+
+    reference_id = reference_id.strip()
+    created_at = datetime.now(timezone.utc).isoformat()
+    debit = {
+        "id": str(uuid4()),
+        "account_id": source_account_id,
+        "type": "debit",
+        "amount": amount,
+        "description": description,
+        "reference_id": reference_id,
+        "created_at": created_at,
+    }
+    credit = {
+        "id": str(uuid4()),
+        "account_id": destination_account_id,
+        "type": "credit",
+        "amount": amount,
+        "description": description,
+        "reference_id": reference_id,
+        "created_at": created_at,
+    }
+    transfer_transactions = (debit, credit)
+
+    connection = get_connection()
+    try:
+        # Lock writes while checking both accounts and applying both sides.
+        connection.execute("BEGIN IMMEDIATE")
+        source = connection.execute(
+            "SELECT balance FROM accounts WHERE id = ?", (source_account_id,)
+        ).fetchone()
+        destination = connection.execute(
+            "SELECT balance FROM accounts WHERE id = ?", (destination_account_id,)
+        ).fetchone()
+        if source is None or destination is None:
+            raise ValueError("Account not found")
+
+        for transaction in transfer_transactions:
+            existing = connection.execute(
+                """
+                SELECT id FROM transactions
+                WHERE account_id = ? AND reference_id = ?
+                """,
+                (transaction["account_id"], reference_id),
+            ).fetchone()
+            if existing is not None:
+                raise ValueError("Transaction already exists")
+
+        if source[0] < amount:
+            raise ValueError("Insufficient balance")
+
+        # Every write below is covered by this connection's single transaction.
+        for transaction in transfer_transactions:
+            connection.execute(
+                """
+                INSERT INTO transactions
+                    (id, account_id, type, amount, description, reference_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    transaction["id"],
+                    transaction["account_id"],
+                    transaction["type"],
+                    transaction["amount"],
+                    transaction["description"],
+                    transaction["reference_id"],
+                    transaction["created_at"],
+                ),
+            )
+
+        connection.execute(
+            "UPDATE accounts SET balance = balance - ? WHERE id = ?",
+            (amount, source_account_id),
+        )
+        connection.execute(
+            "UPDATE accounts SET balance = balance + ? WHERE id = ?",
+            (amount, destination_account_id),
+        )
+        for transaction in transfer_transactions:
+            save_attempt(connection, transaction, "success")
+        connection.commit()
+    except Exception as error:
+        connection.rollback()
+        # Keep a record of the failed transfer after rolling back its money changes.
+        try:
+            for transaction in transfer_transactions:
+                save_attempt(connection, transaction, "failed", str(error))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            logger.exception("Could not save failed transfer attempts")
+        raise
+    finally:
+        connection.close()
+
+    return {
+        "source_transaction": debit,
+        "destination_transaction": credit,
+    }
+
+

@@ -12,6 +12,7 @@ from .services import (
     get_account_balance,
     get_accounts,
     get_transaction_history,
+    transfer_money,
 )
 
 
@@ -33,6 +34,16 @@ class CreateAccountRequest(BaseModel):
 class TransactionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
+    amount: int = Field(gt=0, strict=True, description="Amount in paise: 5000 means INR 50")
+    reference_id: str = Field(min_length=1)
+    description: str = ""
+
+
+class TransferRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    source_account_id: str = Field(min_length=1)
+    destination_account_id: str = Field(min_length=1)
     amount: int = Field(gt=0, strict=True, description="Amount in paise: 5000 means INR 50")
     reference_id: str = Field(min_length=1)
     description: str = ""
@@ -107,6 +118,26 @@ def debit_account_endpoint(account_id: str, request: TransactionRequest):
     try:
         return debit_account(
             account_id, request.amount, request.reference_id, request.description
+        )
+    except ValueError as error:
+        if str(error) == "Account not found":
+            status_code = 404
+        elif str(error) in ("Transaction already exists", "Insufficient balance"):
+            status_code = 409
+        else:
+            status_code = 422
+        raise HTTPException(status_code=status_code, detail=str(error)) from error
+
+
+@app.post("/transfers", status_code=201)
+def transfer_endpoint(request: TransferRequest):
+    try:
+        return transfer_money(
+            request.source_account_id,
+            request.destination_account_id,
+            request.amount,
+            request.reference_id,
+            request.description,
         )
     except ValueError as error:
         if str(error) == "Account not found":
